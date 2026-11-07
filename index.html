@@ -753,12 +753,27 @@
 			updateShieldVisibility(rankTier, shieldCount);
 		}
 
+		let leaderboardLookupIssue = '';
+		function setRankStatus(message) {
+			let status = document.getElementById('rank-status');
+			if (!status) {
+				status = document.createElement('div');
+				status.id = 'rank-status';
+				status.setAttribute('role', 'status');
+				status.style.cssText = 'font-size:16px;line-height:1.35;color:#ffe0a3;white-space:normal;max-width:330px;margin-top:8px;text-shadow:1px 1px 3px #000';
+				document.querySelector('.right-content').appendChild(status);
+			}
+			status.textContent = message;
+			status.hidden = !message;
+		}
+
 		function positiveLeaderboardRank(value) {
 			const rank = Number(value);
 			return Number.isSafeInteger(rank) && rank > 0 ? rank : null;
 		}
 
 		async function fetchMMRWithOptionalRetry(url, wantsPlacement) {
+			leaderboardLookupIssue = '';
 			const response = await fetch(url, { cache: 'no-store' });
 			if (!response.ok) throw new Error(`API request failed with status ${response.status}`);
 			const json = await response.json();
@@ -781,7 +796,12 @@
 			const timeout = setTimeout(() => controller.abort(), 10000);
 			try {
 				const result = await fetch(leaderboardURL.toString(), { cache: 'no-store', signal: controller.signal });
-				if (!result.ok) throw new Error(`Leaderboard request failed with status ${result.status}`);
+				if (!result.ok) {
+					leaderboardLookupIssue = result.status === 404
+						? 'Leaderboard unavailable: player not found (404)'
+						: `Leaderboard unavailable: HTTP ${result.status}`;
+					throw new Error(leaderboardLookupIssue);
+				}
 				const leaderboard = await result.json();
 				const players = leaderboard?.data?.players;
 				const player = Array.isArray(players) ? players.find(p =>
@@ -792,9 +812,13 @@
 				) : null;
 				const rank = positiveLeaderboardRank(player?.leaderboard_rank);
 				if (rank) current.leaderboard_placement = { rank };
+				else leaderboardLookupIssue = 'Leaderboard unavailable: no matching placement returned';
 			} catch (error) {
 				// A leaderboard outage must not stop RR and tier from updating.
-				console.warn('[ValRank] Leaderboard lookup unavailable:', error.message);
+				if (!leaderboardLookupIssue) leaderboardLookupIssue = error.name === 'AbortError'
+					? 'Leaderboard unavailable: request timed out'
+					: 'Leaderboard unavailable: network or browser access error';
+				console.warn('[ValRank] Leaderboard lookup unavailable:', leaderboardLookupIssue);
 			} finally {
 				clearTimeout(timeout);
 			}
@@ -803,6 +827,7 @@
 
 		async function checkRank() {
 			try {
+				leaderboardLookupIssue = '';
 				const useMockData = document.getElementById("use-mock-data")?.checked || false;
 				let data;
 				let url = null;
@@ -825,19 +850,20 @@
 					const reqPlatform = normalizePlatform(PLATFORM);
 					url = `https://api.henrikdev.xyz/valorant/v3/mmr/${reqRegion}/${reqPlatform}/${encodeURIComponent(USERNAME)}/${encodeURIComponent(TAG)}?api_key=${encodeURIComponent(API_KEY)}`;
 					if (new URLSearchParams(window.location.search).get('logs') === '1') {
-						console.log('[ValRank] Request URL:', url);
+						console.log('[ValRank] Request:', reqRegion, reqPlatform, USERNAME, TAG);
 					}
 					const wantsPlacementHint = true;
 					data = await fetchMMRWithOptionalRetry(url, wantsPlacementHint);
 				}
 
 				const currentNode = data?.data?.current ?? data?.current ?? null;
-				const currentData = currentNode || {};
+				if (!currentNode?.tier?.name) throw new Error('API returned no current rank data');
+				const currentData = currentNode;
 				const leaderboardPlacement = currentData?.leaderboard_placement ?? null;
 
 				if (new URLSearchParams(window.location.search).get('logs') === '1') {
 					console.groupCollapsed('[ValRank] Raw payload sniff');
-					console.log('Request URL:', url);
+					console.log('Account:', REGION, PLATFORM, USERNAME, TAG);
 					console.log('data:', data);
 					console.log('currentData:', currentData);
 					console.log('leaderboard_placement:', leaderboardPlacement);
@@ -881,6 +907,9 @@
 				const newRankRating = Math.max(0, newRankRatingRaw || 0);
 
 				rankRatingEl.dataset.tierName = newRankTier;
+				setRankStatus(!hasLeaderboard && (isImmortal || isRadiant)
+					? (leaderboardLookupIssue || 'Leaderboard unavailable: API returned no position')
+					: '');
 
 				if (previousRankTier === null || previousRankRating === null || previousHadLeaderboard === null) {
 					document.getElementById('rank-rating').textContent = `${newRankRating} RR`;
@@ -1061,6 +1090,9 @@
 				previousShieldCount = shieldCount;
 
 			} catch (error) {
+				setRankStatus(error.message.startsWith('API request failed with status ')
+					? error.message.replace('API request failed with status ', 'Rank data unavailable: HTTP ')
+					: 'Rank data unavailable: check configuration or API connection');
 				console.error('Error fetching rank data:', error);
 			}
 		}
