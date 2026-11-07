@@ -753,22 +753,50 @@
 			updateShieldVisibility(rankTier, shieldCount);
 		}
 
+		function positiveLeaderboardRank(value) {
+			const rank = Number(value);
+			return Number.isSafeInteger(rank) && rank > 0 ? rank : null;
+		}
+
 		async function fetchMMRWithOptionalRetry(url, wantsPlacement) {
-			const r1 = await fetch(url);
-			if (!r1.ok) throw new Error(`API request failed with status ${r1.status}`);
-			let json = await r1.json();
+			const response = await fetch(url, { cache: 'no-store' });
+			if (!response.ok) throw new Error(`API request failed with status ${response.status}`);
+			const json = await response.json();
+			const current = json?.data?.current ?? json?.current;
+			if (!current || !wantsPlacement ||
+				positiveLeaderboardRank(current.leaderboard_placement?.rank) ||
+				!(current.tier?.name === 'Radiant' || current.tier?.name?.startsWith('Immortal'))) return json;
 
-			const cur = json?.data?.current ?? json?.current ?? null;
-			const lb = cur?.leaderboard_placement ?? null;
-
-			if (wantsPlacement && !lb) {
-				await new Promise(res => setTimeout(res, 800));
-				const r2 = await fetch(url, { cache: 'no-store' });
-				if (!r2.ok) return json;
-				const json2 = await r2.json();
-				const cur2 = json2?.data?.current ?? json2?.current ?? null;
-				const lb2 = cur2?.leaderboard_placement ?? null;
-				if (lb2) return json2;
+			// MMR can omit placement. Query the dedicated leaderboard for this account.
+			const leaderboardURL = new URL(`https://api.henrikdev.xyz/valorant/v3/leaderboard/${normalizeRegion(REGION)}/${normalizePlatform(PLATFORM)}`);
+			leaderboardURL.searchParams.set('api_key', API_KEY);
+			const account = json?.data?.account ?? json?.account;
+			if (account?.puuid) {
+				leaderboardURL.searchParams.set('puuid', account.puuid);
+			} else {
+				leaderboardURL.searchParams.set('name', USERNAME);
+				leaderboardURL.searchParams.set('tag', TAG);
+			}
+			const controller = new AbortController();
+			const timeout = setTimeout(() => controller.abort(), 10000);
+			try {
+				const result = await fetch(leaderboardURL.toString(), { cache: 'no-store', signal: controller.signal });
+				if (!result.ok) throw new Error(`Leaderboard request failed with status ${result.status}`);
+				const leaderboard = await result.json();
+				const players = leaderboard?.data?.players;
+				const player = Array.isArray(players) ? players.find(p =>
+					account?.puuid ? p.puuid === account.puuid :
+					typeof p.name === 'string' && typeof p.tag === 'string' &&
+					p.name.toLowerCase() === USERNAME.toLowerCase() &&
+					p.tag.toLowerCase() === TAG.toLowerCase()
+				) : null;
+				const rank = positiveLeaderboardRank(player?.leaderboard_rank);
+				if (rank) current.leaderboard_placement = { rank };
+			} catch (error) {
+				// A leaderboard outage must not stop RR and tier from updating.
+				console.warn('[ValRank] Leaderboard lookup unavailable:', error.message);
+			} finally {
+				clearTimeout(timeout);
 			}
 			return json;
 		}
@@ -827,7 +855,7 @@
 					const parsed = typeof leaderboardPlacement.rank === 'string'
 						? parseInt(leaderboardPlacement.rank, 10)
 						: leaderboardPlacement.rank;
-					if (!isNaN(parsed) && isFinite(parsed)) {
+					if (positiveLeaderboardRank(parsed)) {
 						hasLeaderboard = true;
 						newLeaderboardRank = parsed;
 					}
